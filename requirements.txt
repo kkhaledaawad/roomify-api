@@ -1,6 +1,6 @@
 fastapi==0.95.2
 uvicorn==0.22.0
-torch==2.0.1+cpu         # Adjust to your GPU/CUDA version; see https://pytorch.org
+torch==2.0.1         # Adjust to your GPU/CUDA version; see https://pytorch.org
 diffusers[training]==0.14.0
 transformers==4.27.4
 safetensors==0.4.0
