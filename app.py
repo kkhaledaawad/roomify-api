@@ -12,8 +12,8 @@ from io import BytesIO
 app = FastAPI()
 
 # 1) Environment vars (set these in Render dashboard later)
-S3_BUCKET = os.getenv("my-roomify-models")                # e.g. "my-roomify-models"
-S3_PREFIX = os.getenv("roomify-checkpoint-final")                # e.g. "roomify/checkpoint-final"
+S3_BUCKET = os.getenv("S3_BUCKET")                # e.g. "my-roomify-models"
+S3_PREFIX = os.getenv("S3_PREFIX")                # e.g. "roomify/checkpoint-final"
 MODEL_DIR = "/tmp/checkpoint-final"               # where we’ll store the model locally
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
