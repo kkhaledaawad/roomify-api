@@ -1,0 +1,8 @@
+fastapi==0.95.2
+uvicorn==0.22.0
+torch==2.0.1+cu118         # Adjust to your GPU/CUDA version; see https://pytorch.org
+diffusers[training]==0.14.0
+transformers==4.27.4
+safetensors==0.4.0
+Pillow==11.2.1
+boto3==1.31.1             # for downloading from S3

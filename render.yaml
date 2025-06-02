@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: roomify-img2img
+    env: python
+    plan: gpu-small
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port 8000"
+    envVars:
+      - key: S3_BUCKET
+        value: my-roomify-models
+      - key: S3_PREFIX
+        value: roomify/checkpoint-final
+      - key: AWS_ACCESS_KEY_ID
+        fromService:
+          name: my-aws-creds
+          key: AWS_ACCESS_KEY_ID
+      - key: AWS_SECRET_ACCESS_KEY
+        fromService:
+          name: my-aws-creds
+          key: AWS_SECRET_ACCESS_KEY
+      - key: AWS_DEFAULT_REGION
+        value: us-west-2
