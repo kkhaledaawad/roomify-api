@@ -1,8 +1,9 @@
 fastapi==0.95.2
 uvicorn==0.22.0
-torch==2.0.1         # Adjust to your GPU/CUDA version; see https://pytorch.org
-diffusers[training]==0.14.0
+torch==2.0.1           # or torch==2.0.1+cpu if CPU‐only
+diffusers==0.14.0
+huggingface_hub==0.13.3
 transformers==4.27.4
 safetensors==0.4.0
 Pillow==11.2.1
-boto3             # for downloading from S3
+boto3==1.28.27
