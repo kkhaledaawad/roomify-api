@@ -1,18 +1,18 @@
 import os
 import shutil
 import boto3
+import io
 
 import torch
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from PIL import Image
-import io
 
 from diffusers import (
     StableDiffusionImg2ImgPipeline,
     UniPCMultistepScheduler,
-    AutoencoderKL,
     UNet2DConditionModel,
+    AutoencoderKL,
 )
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -27,27 +27,27 @@ AWS_REGION            = os.getenv("AWS_DEFAULT_REGION", "us-west-2")
 AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
-# Hard‐coded inference parameters (no need to pass each time)
+# Inference parameters (hard‐coded)
 FIXED_STRENGTH   = float(os.getenv("FIXED_STRENGTH", "0.75"))
 FIXED_GUIDANCE   = float(os.getenv("FIXED_GUIDANCE", "7.5"))
 FIXED_STEPS      = int(os.getenv("FIXED_STEPS", "30"))
 
-# Which device to run on
+# Device selection
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# This will hold our loaded pipeline once startup completes
+# This global will hold our loaded pipeline
 pipeline = None
 
 
 def download_checkpoint_from_s3():
     """
-    Downloads all objects under S3_BUCKET/S3_PREFIX into /tmp/checkpoint-final/,
-    preserving folder structure. Skips any “folder placeholder” keys that end in “/”.
+    Download all objects under S3_BUCKET/S3_PREFIX into ./checkpoint-final/,
+    preserving folder structure. Skip any “folder placeholder” (keys ending in '/').
     """
     if not S3_BUCKET or not S3_PREFIX:
         raise RuntimeError("S3_BUCKET and S3_PREFIX must both be set in the environment.")
 
-    # Build a boto3 S3 client using credentials from ENV
+    # Create an S3 client
     s3 = boto3.client(
         "s3",
         region_name=AWS_REGION,
@@ -55,36 +55,37 @@ def download_checkpoint_from_s3():
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY
     )
 
-    local_root = "/tmp/checkpoint-final"
-    # If leftover from a previous run, remove it
+    # Instead of /tmp, write to a folder in the app’s working directory:
+    local_root = os.path.join(os.getcwd(), "checkpoint-final")
+
+    # If it already exists (from previous run), delete it:
     if os.path.exists(local_root):
         shutil.rmtree(local_root)
     os.makedirs(local_root, exist_ok=True)
 
     paginator = s3.get_paginator("list_objects_v2")
-
-    # Iterate over every page of results under that prefix
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX):
         for obj in page.get("Contents", []):
             key = obj["Key"]  # e.g. "roomify-checkpoint-final/unet/config.json"
-            # Skip keys that end with "/" (S3 folder placeholders)
+
+            # Skip "folder" keys (they end with "/")
             if key.endswith("/"):
                 continue
 
-            # Compute the relative path under our prefix:
-            # If S3_PREFIX = "roomify-checkpoint-final/"
-            # and key = "roomify-checkpoint-final/unet/config.json",
+            # Compute path relative to the prefix:
+            # If S3_PREFIX="roomify-checkpoint-final/"
+            # and key="roomify-checkpoint-final/unet/config.json",
             # then rel_path = "unet/config.json"
             rel_path = os.path.relpath(key, S3_PREFIX)
 
-            # Build the full local path where we will store this file
+            # Full local path
             local_file_path = os.path.join(local_root, rel_path)
 
-            # Ensure the directory exists
+            # Ensure subfolders exist
             local_dir = os.path.dirname(local_file_path)
             os.makedirs(local_dir, exist_ok=True)
 
-            # Download the object into that exact filename
+            # Download into that exact filename
             s3.download_file(S3_BUCKET, key, local_file_path)
             print(f"Downloaded s3://{S3_BUCKET}/{key} → {local_file_path}")
 
@@ -93,20 +94,20 @@ def download_checkpoint_from_s3():
 
 def load_img2img_pipeline():
     """
-    1. Downloads the fine-tuned components from S3 into /tmp/checkpoint-final/
-    2. Instantiates a base StableDiffusionImg2ImgPipeline from Hugging Face Hub (v1.5),
-       then overwrites its text_encoder, tokenizer, and unet with your fine-tuned files.
-    3. Replaces its scheduler with UniPCMultistepScheduler.
-    4. Moves the pipeline to the appropriate device (GPU if available).
+    1) Downloads the fine‐tuned pieces from S3 into ./checkpoint-final/.
+    2) Instantiates a base Img2Img pipeline from the cache (v1.5), then overwrites
+       its tokenizer, text_encoder, and unet with our fine‐tuned folders.
+    3) Replaces the scheduler with UniPCMultistepScheduler.
+    4) Moves pipeline onto DEVICE.
     """
     global pipeline
 
-    # 1) Download everything from S3 → /tmp/checkpoint-final/
+    # 1) Download your fine‐tuned checkpoints into ./checkpoint-final/
     download_checkpoint_from_s3()
-    local_root = "/tmp/checkpoint-final"
+    local_root = os.path.join(os.getcwd(), "checkpoint-final")
 
-    # 2) Instantiate a base Img2Img pipeline (v1.5) from the Hub
-    #    We will keep its original VAE, but overwrite text_encoder/tokenizer/unet below.
+    # 2) Load a base Img2Img pipeline from the Hugging Face cache (not from S3),
+    #    assuming you already cached v1.5 during build time.
     base_model_id = "runwayml/stable-diffusion-v1-5"
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         base_model_id,
@@ -114,27 +115,20 @@ def load_img2img_pipeline():
         torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
     )
 
-    # 3) Overwrite the tokenizer & text_encoder with the fine-tuned versions:
-    #    Our S3 structure contains:
-    #      /tmp/checkpoint-final/text_encoder/config.json
-    #      /tmp/checkpoint-final/text_encoder/pytorch_model.bin
-    #      /tmp/checkpoint-final/tokenizer/...
-    #      /tmp/checkpoint-final/unet/...
-    pipe.tokenizer = CLIPTokenizer.from_pretrained(os.path.join(local_root, "tokenizer"))
+    # 3) Overwrite tokenizer + text_encoder with our fine‐tuned versions:
+    pipe.tokenizer    = CLIPTokenizer.from_pretrained(os.path.join(local_root, "tokenizer"))
     pipe.text_encoder = CLIPTextModel.from_pretrained(os.path.join(local_root, "text_encoder"))
 
-    # 4) Overwrite the UNet with our fine-tuned UNet:
+    # 4) Overwrite UNet with our fine‐tuned UNet:
     pipe.unet = UNet2DConditionModel.from_pretrained(os.path.join(local_root, "unet"))
 
-    # 5) (Optional) If you wish to keep the VAE from the fine-tuned checkpoint, you could load it similarly:
-    #    pipe.vae = AutoencoderKL.from_pretrained(os.path.join(local_root, "vae"))
-    #    BUT often DreamBooth fine-tunes only U-Net + Text Encoder, leaving VAE untouched.
-    #    In that case, the base model’s VAE is fine. We’ll leave pipe.vae as is.
+    # (Optional) If you also fine‐tuned VAE, you could do:
+    # pipe.vae = AutoencoderKL.from_pretrained(os.path.join(local_root, "vae"))
 
-    # 6) Swap in UniPCMultistepScheduler for faster sampling:
+    # 5) Swap in UniPCMultistepScheduler for faster sampling:
     pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
 
-    # 7) Move the entire pipeline to GPU (if available) or CPU otherwise:
+    # 6) Move pipeline onto GPU (if available)
     pipe = pipe.to(DEVICE)
 
     pipeline = pipe
@@ -144,9 +138,9 @@ def load_img2img_pipeline():
 @app.on_event("startup")
 def on_startup():
     """
-    Runs at service startup:
-      • Downloads checkpoint from S3
-      • Loads/upgrades the pipeline
+    At startup:
+      • Download S3 checkpoint → ./checkpoint-final/
+      • Load/overwrite the pipeline components
     """
     try:
         load_img2img_pipeline()
@@ -157,15 +151,14 @@ def on_startup():
 @app.get("/health")
 def health_check():
     """
-    Simple health endpoint to verify the pipeline is loaded.
+    Simple healthcheck returning status and inference settings.
     """
     if pipeline is None:
         return {"status": "error", "detail": "Pipeline not loaded."}
-
     return {
         "status": "ok",
         "device": str(DEVICE),
-        "model_dir": "/tmp/checkpoint-final",
+        "model_dir": os.path.join(os.getcwd(), "checkpoint-final"),
         "fixed_strength": FIXED_STRENGTH,
         "fixed_guidance": FIXED_GUIDANCE,
         "fixed_steps": FIXED_STEPS,
@@ -175,16 +168,15 @@ def health_check():
 @app.post("/generate")
 async def generate_image(prompt: str, image: UploadFile = File(...)):
     """
-    Expects a multipart/form-data POST with:
-      • prompt: a string (must include "<interiorx>")
-      • image: the input room photo (JPEG or PNG)
-
-    Returns: the generated image as a raw PNG in the response body.
+    Expects multipart/form-data with:
+      • prompt: a string containing "<interiorx>"
+      • image: the room photo (JPEG/PNG)
+    Returns a generated image as raw PNG.
     """
     if pipeline is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet.")
+        raise HTTPException(status_code=503, detail="Model not loaded yet. Try again in a moment.")
 
-    # Read the uploaded file into a PIL Image
+    # Read the uploaded image into a PIL Image and resize to 512×512
     try:
         contents = await image.read()
         init_image = Image.open(io.BytesIO(contents)).convert("RGB")
@@ -192,7 +184,7 @@ async def generate_image(prompt: str, image: UploadFile = File(...)):
     except Exception:
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.")
 
-    # Run the Img2Img pipeline with fixed parameters
+    # Run Img2Img with fixed parameters
     try:
         results = pipeline(
             prompt=prompt,
@@ -205,9 +197,8 @@ async def generate_image(prompt: str, image: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
-    # Convert to in‐memory PNG bytes
+    # Convert to in‐memory PNG and stream back
     buffer = io.BytesIO()
     generated.save(buffer, format="PNG")
     buffer.seek(0)
-
     return StreamingResponse(buffer, media_type="image/png")
