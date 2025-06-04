@@ -11,6 +11,10 @@ from starlette.middleware.cors import CORSMiddleware
 import asyncio
 from typing import Optional
 
+torch.set_num_threads(4)  # B3 has 4 vCPUs
+if torch.cuda.is_available():
+    print("WARNING: GPU detected but not available in App Service. Using CPU.")
+
 # ----------------------------------------------------------------------
 # READ ENVIRONMENT VARIABLES
 # ----------------------------------------------------------------------
