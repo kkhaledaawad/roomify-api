@@ -118,6 +118,75 @@ def download_checkpoint_from_s3():
         raise RuntimeError(f"No files found under s3://{S3_BUCKET}/{S3_PREFIX}")
     
     print(f"✅ Downloaded {total_files} files to {TMP_CHECKPOINT_DIR}")
+    
+def fix_missing_model_components():
+    """Add missing model_index.json and download VAE if needed"""
+    import json
+    
+    # Create model_index.json if missing
+    model_index_path = os.path.join(TMP_CHECKPOINT_DIR, "model_index.json")
+    if not os.path.exists(model_index_path):
+        print("Creating model_index.json...")
+        model_index = {
+            "_class_name": "StableDiffusionImg2ImgPipeline",
+            "_diffusers_version": "0.14.0",
+            "feature_extractor": ["transformers", "CLIPImageProcessor"],
+            "requires_safety_checker": False,
+            "safety_checker": None,
+            "scheduler": ["diffusers", "PNDMScheduler"],
+            "text_encoder": ["transformers", "CLIPTextModel"],
+            "tokenizer": ["transformers", "CLIPTokenizer"],
+            "unet": ["diffusers", "UNet2DConditionModel"],
+            "vae": ["diffusers", "AutoencoderKL"]
+        }
+        
+        with open(model_index_path, 'w') as f:
+            json.dump(model_index, f, indent=2)
+    
+    # Download VAE if missing
+    vae_path = os.path.join(TMP_CHECKPOINT_DIR, "vae")
+    if not os.path.exists(vae_path):
+        print("VAE component missing. Downloading from HuggingFace...")
+        try:
+            from diffusers import AutoencoderKL
+            vae = AutoencoderKL.from_pretrained(
+                "runwayml/stable-diffusion-v1-5",
+                subfolder="vae",
+                torch_dtype=torch.float32
+            )
+            vae.save_pretrained(vae_path)
+            print("✅ VAE component downloaded successfully")
+        except Exception as e:
+            print(f"❌ Failed to download VAE: {e}")
+            # Try alternative download method
+            os.makedirs(vae_path, exist_ok=True)
+            
+            # Download VAE config
+            vae_config = {
+                "_class_name": "AutoencoderKL",
+                "_diffusers_version": "0.14.0",
+                "act_fn": "silu",
+                "block_out_channels": [128, 256, 512, 512],
+                "down_block_types": ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
+                "in_channels": 3,
+                "latent_channels": 4,
+                "layers_per_block": 2,
+                "norm_num_groups": 32,
+                "out_channels": 3,
+                "sample_size": 512,
+                "up_block_types": ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
+            }
+            
+            with open(os.path.join(vae_path, "config.json"), 'w') as f:
+                json.dump(vae_config, f, indent=2)
+            
+            # Download weights using urllib
+            import urllib.request
+            vae_url = "https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/vae/diffusion_pytorch_model.bin"
+            vae_weights_path = os.path.join(vae_path, "diffusion_pytorch_model.bin")
+            print("Downloading VAE weights... This may take a few minutes...")
+            urllib.request.urlretrieve(vae_url, vae_weights_path)
+            print("✅ VAE weights downloaded")
 
 # ----------------------------------------------------------------------
 # ASYNC MODEL LOADING
@@ -133,6 +202,9 @@ async def load_model_async():
         if not os.path.exists(os.path.join(TMP_CHECKPOINT_DIR, "model_index.json")):
             print("Model not found locally. Downloading from S3...")
             download_checkpoint_from_s3()
+            
+            # Fix missing components after download
+            fix_missing_model_components()
         else:
             print("Model found locally. Skipping download.")
         
