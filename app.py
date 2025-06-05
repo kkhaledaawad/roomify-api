@@ -12,11 +12,15 @@ import asyncio
 from typing import Optional
 import traceback
 import gc
+import json
 
+# Optimize PyTorch for CPU usage
 torch.set_num_threads(4)
+torch.set_grad_enabled(False)  # Disable gradients for inference
 
-if torch.cuda.is_available():
-    print("WARNING: GPU detected but possibly not available in App Service. Using CPU.")
+# Force CPU for Azure App Service
+DEVICE = torch.device("cpu")
+print(f"Using device: {DEVICE}")
 
 # ----------------------------------------------------------------------
 # READ ENVIRONMENT VARIABLES
@@ -39,7 +43,6 @@ def is_s3_configured():
 CHECKPOINT_PARENT_DIR = "/home"
 TMP_CHECKPOINT_DIR = os.path.join(CHECKPOINT_PARENT_DIR, "checkpoint-final")
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PIPELINE: Optional[StableDiffusionImg2ImgPipeline] = None
 MODEL_LOADING = False
 MODEL_LOADED = False
@@ -47,7 +50,7 @@ MODEL_LOAD_ERROR = None
 
 FIXED_STRENGTH = 0.5
 FIXED_GUIDANCE_SCALE = 7.5
-FIXED_STEPS = 30
+FIXED_STEPS = 20  # Reduced from 30 for faster inference
 
 # ----------------------------------------------------------------------
 # FASTAPI APP SETUP
@@ -96,6 +99,14 @@ def download_checkpoint_from_s3():
         raise RuntimeError("S3 configuration incomplete—check all required environment variables!")
 
     print(f"Starting download from s3://{S3_BUCKET}/{S3_PREFIX}")
+    
+    # Create a marker file to track download completion
+    marker_file = os.path.join(TMP_CHECKPOINT_DIR, ".download_complete")
+    
+    # Check if already downloaded
+    if os.path.exists(marker_file):
+        print("Model already downloaded (marker file exists). Skipping S3 download.")
+        return
 
     s3 = boto3.client(
         "s3",
@@ -111,13 +122,12 @@ def download_checkpoint_from_s3():
     except Exception as e:
         raise RuntimeError(f"Error paginating S3 bucket: {e}")
 
-    downloaded_any = False
-    total_files = 0
+    downloaded_files = 0
 
     try:
         for page in pages:
             if page is None or page.get("Contents") is None:
-                continue  # skip empty or missing pages
+                continue
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 if key.endswith("/"):
@@ -126,31 +136,40 @@ def download_checkpoint_from_s3():
                 local_path = os.path.join(TMP_CHECKPOINT_DIR, relative_path)
                 local_dir = os.path.dirname(local_path)
                 os.makedirs(local_dir, exist_ok=True)
+                
+                # Skip if file already exists with same size
+                if os.path.exists(local_path):
+                    local_size = os.path.getsize(local_path)
+                    if local_size == obj['Size']:
+                        print(f"Skipping {relative_path} (already exists with correct size)")
+                        continue
+                
                 print(f"Downloading: {relative_path}")
                 try:
                     s3.download_file(S3_BUCKET, key, local_path)
+                    downloaded_files += 1
                 except Exception as inner_e:
                     print(f"Error downloading {key}: {inner_e}")
-                    continue
-                downloaded_any = True
-                total_files += 1
+                    raise
     except Exception as e:
-        raise RuntimeError(f"S3 download page iteration error: {e}")
+        raise RuntimeError(f"S3 download error: {e}")
 
-    if not downloaded_any:
+    if downloaded_files == 0 and not os.path.exists(os.path.join(TMP_CHECKPOINT_DIR, "model_index.json")):
         raise RuntimeError(f"No files found under s3://{S3_BUCKET}/{S3_PREFIX}")
 
-    print(f"✅ Downloaded {total_files} files to {TMP_CHECKPOINT_DIR}")
+    # Create marker file
+    with open(marker_file, 'w') as f:
+        f.write(f"Downloaded {downloaded_files} files")
+        
+    print(f"✅ Downloaded {downloaded_files} files to {TMP_CHECKPOINT_DIR}")
 
 def fix_missing_model_components():
-    import json
-
     model_index_path = os.path.join(TMP_CHECKPOINT_DIR, "model_index.json")
     if not os.path.exists(model_index_path):
         print("Creating model_index.json...")
         model_index = {
             "_class_name": "StableDiffusionImg2ImgPipeline",
-            "_diffusers_version": "0.14.0",
+            "_diffusers_version": "0.21.0",
             "feature_extractor": ["transformers", "CLIPImageProcessor"],
             "requires_safety_checker": False,
             "safety_checker": None,
@@ -163,44 +182,52 @@ def fix_missing_model_components():
         with open(model_index_path, 'w') as f:
             json.dump(model_index, f, indent=2)
 
-    vae_path = os.path.join(TMP_CHECKPOINT_DIR, "vae")
-    if not os.path.exists(vae_path):
-        print("VAE component missing. Downloading from HuggingFace...")
-        try:
-            from diffusers import AutoencoderKL
-            vae = AutoencoderKL.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                subfolder="vae",
-                torch_dtype=torch.float32
-            )
-            vae.save_pretrained(vae_path)
-            print("✅ VAE component downloaded successfully")
-        except Exception as e:
-            print(f"❌ Failed to download VAE: {e}")
-            os.makedirs(vae_path, exist_ok=True)
+    # Create scheduler config if missing
+    scheduler_dir = os.path.join(TMP_CHECKPOINT_DIR, "scheduler")
+    if not os.path.exists(scheduler_dir):
+        os.makedirs(scheduler_dir, exist_ok=True)
+        scheduler_config = {
+            "_class_name": "PNDMScheduler",
+            "_diffusers_version": "0.21.0",
+            "beta_end": 0.012,
+            "beta_schedule": "scaled_linear",
+            "beta_start": 0.00085,
+            "num_train_timesteps": 1000,
+            "set_alpha_to_one": False,
+            "skip_prk_steps": True,
+            "steps_offset": 1,
+            "trained_betas": None,
+            "clip_sample": False
+        }
+        with open(os.path.join(scheduler_dir, "scheduler_config.json"), 'w') as f:
+            json.dump(scheduler_config, f, indent=2)
 
-            vae_config = {
-                "_class_name": "AutoencoderKL",
-                "_diffusers_version": "0.14.0",
-                "act_fn": "silu",
-                "block_out_channels": [128, 256, 512, 512],
-                "down_block_types": ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
-                "in_channels": 3,
-                "latent_channels": 4,
-                "layers_per_block": 2,
-                "norm_num_groups": 32,
-                "out_channels": 3,
-                "sample_size": 512,
-                "up_block_types": ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
-            }
-            with open(os.path.join(vae_path, "config.json"), 'w') as f:
-                json.dump(vae_config, f, indent=2)
-            import urllib.request
-            vae_url = "https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/vae/diffusion_pytorch_model.bin"
-            vae_weights_path = os.path.join(vae_path, "diffusion_pytorch_model.bin")
-            print("Downloading VAE weights... This may take a few minutes...")
-            urllib.request.urlretrieve(vae_url, vae_weights_path)
-            print("✅ VAE weights downloaded")
+def verify_model_files():
+    """Verify that critical model files exist"""
+    critical_files = [
+        "model_index.json",
+        "unet/diffusion_pytorch_model.bin",
+        "unet/config.json",
+        "text_encoder/pytorch_model.bin",
+        "text_encoder/config.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/vocab.json",
+        "vae/diffusion_pytorch_model.bin",
+        "vae/config.json"
+    ]
+    
+    missing_files = []
+    for file_path in critical_files:
+        full_path = os.path.join(TMP_CHECKPOINT_DIR, file_path)
+        if not os.path.exists(full_path):
+            missing_files.append(file_path)
+    
+    if missing_files:
+        print(f"⚠️ Missing critical files: {missing_files}")
+        return False
+    
+    print("✅ All critical model files verified")
+    return True
 
 # ----------------------------------------------------------------------
 # ASYNC MODEL LOADING
@@ -211,6 +238,11 @@ async def load_model_async():
 
     MODEL_LOADING = True
     try:
+        # Clear any existing model from memory
+        if PIPELINE is not None:
+            del PIPELINE
+            gc.collect()
+        
         if not os.path.exists(os.path.join(TMP_CHECKPOINT_DIR, "model_index.json")):
             print("Model not found locally. Downloading from S3...")
             check_persistent_storage()  # raise error if storage is not usable
@@ -219,23 +251,43 @@ async def load_model_async():
         else:
             print("Model found locally. Skipping download.")
 
+        # Verify files before loading
+        if not verify_model_files():
+            raise RuntimeError("Model files verification failed")
+
         print("Loading Stable Diffusion pipeline...")
+        
+        # Load with CPU optimizations
         PIPELINE = StableDiffusionImg2ImgPipeline.from_pretrained(
             TMP_CHECKPOINT_DIR,
-            torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+            torch_dtype=torch.float32,  # Use float32 for CPU
             safety_checker=None,
+            requires_safety_checker=False,
             low_cpu_mem_usage=True,
+            device_map=None,
+            local_files_only=True,
         )
+        
+        # Use memory-efficient scheduler
         PIPELINE.scheduler = UniPCMultistepScheduler.from_config(PIPELINE.scheduler.config)
-        PIPELINE.to(DEVICE)
+        
+        # Move to CPU explicitly
+        PIPELINE = PIPELINE.to(DEVICE)
+        
+        # Enable memory efficient attention if available
+        if hasattr(PIPELINE.unet, 'set_attention_processor'):
+            from diffusers.models.attention_processor import AttnProcessor
+            PIPELINE.unet.set_attention_processor(AttnProcessor())
+        
+        # Enable CPU offload for memory efficiency
+        if hasattr(PIPELINE, 'enable_sequential_cpu_offload'):
+            PIPELINE.enable_sequential_cpu_offload()
 
         MODEL_LOADED = True
         MODEL_LOADING = False
         MODEL_LOAD_ERROR = None
 
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         print("🚀 Model loaded successfully!")
 
     except Exception as e:
@@ -245,8 +297,6 @@ async def load_model_async():
         MODEL_LOAD_ERROR = f"{e}\n{tb_str}"
         print(f"❌ Failed to load model: {MODEL_LOAD_ERROR}")
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 # ----------------------------------------------------------------------
 # STARTUP EVENT
