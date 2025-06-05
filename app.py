@@ -11,6 +11,7 @@ from starlette.middleware.cors import CORSMiddleware
 import asyncio
 from typing import Optional
 import traceback
+import gc
 
 torch.set_num_threads(4)
 
@@ -22,7 +23,7 @@ if torch.cuda.is_available():
 # ----------------------------------------------------------------------
 
 S3_BUCKET = os.getenv("S3_BUCKET")
-S3_PREFIX = os.getenv("S3_PREFIX")  # e.g., "roomify-checkpoint-final/"
+S3_PREFIX = os.getenv("S3_PREFIX")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
@@ -34,7 +35,10 @@ def is_s3_configured():
 # DEFINE GLOBAL VARIABLES
 # ----------------------------------------------------------------------
 
-TMP_CHECKPOINT_DIR = "/tmp/checkpoint-final"
+# Use /home instead of /tmp for persistence on Azure App Service
+CHECKPOINT_PARENT_DIR = "/home"
+TMP_CHECKPOINT_DIR = os.path.join(CHECKPOINT_PARENT_DIR, "checkpoint-final")
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PIPELINE: Optional[StableDiffusionImg2ImgPipeline] = None
 MODEL_LOADING = False
@@ -57,14 +61,34 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change this in production!
+    allow_origins=["*"],  # Change in prod!
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ----------------------------------------------------------------------
-# UTILITY: Download model checkpoint from S3
+# UTILITY: Persistent storage check
+# ----------------------------------------------------------------------
+
+def check_persistent_storage():
+    try:
+        if not os.path.exists(CHECKPOINT_PARENT_DIR):
+            raise RuntimeError(f"Persistent storage base dir {CHECKPOINT_PARENT_DIR} does not exist!")
+        test_file = os.path.join(CHECKPOINT_PARENT_DIR, "test_write.txt")
+        with open(test_file, 'w') as f:
+            f.write("test")
+        with open(test_file, 'r') as f:
+            _ = f.read()
+        os.remove(test_file)
+        print(f"✅ Persistent storage at {CHECKPOINT_PARENT_DIR} is available.")
+        return True
+    except Exception as e:
+        print(f"❌ Persistent storage {CHECKPOINT_PARENT_DIR} check failed: {e}")
+        return False
+
+# ----------------------------------------------------------------------
+# UTILITY: Download model checkpoint from S3 into /home/checkpoint-final
 # ----------------------------------------------------------------------
 
 def download_checkpoint_from_s3():
@@ -72,6 +96,7 @@ def download_checkpoint_from_s3():
         raise RuntimeError("S3 configuration incomplete—check all required environment variables!")
 
     print(f"Starting download from s3://{S3_BUCKET}/{S3_PREFIX}")
+
     s3 = boto3.client(
         "s3",
         aws_access_key_id=AWS_ACCESS_KEY_ID,
@@ -80,26 +105,37 @@ def download_checkpoint_from_s3():
     )
     os.makedirs(TMP_CHECKPOINT_DIR, exist_ok=True)
     paginator = s3.get_paginator("list_objects_v2")
-    pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX)
+
+    try:
+        pages = paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX)
+    except Exception as e:
+        raise RuntimeError(f"Error paginating S3 bucket: {e}")
 
     downloaded_any = False
     total_files = 0
 
-    for page in pages:
-        if page is None or page.get("Contents") is None:
-            continue  # skip empty or missing pages
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/"):
-                continue
-            relative_path = key[len(S3_PREFIX):]
-            local_path = os.path.join(TMP_CHECKPOINT_DIR, relative_path)
-            local_dir = os.path.dirname(local_path)
-            os.makedirs(local_dir, exist_ok=True)
-            print(f"Downloading: {relative_path}")
-            s3.download_file(S3_BUCKET, key, local_path)
-            downloaded_any = True
-            total_files += 1
+    try:
+        for page in pages:
+            if page is None or page.get("Contents") is None:
+                continue  # skip empty or missing pages
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):
+                    continue
+                relative_path = key[len(S3_PREFIX):]
+                local_path = os.path.join(TMP_CHECKPOINT_DIR, relative_path)
+                local_dir = os.path.dirname(local_path)
+                os.makedirs(local_dir, exist_ok=True)
+                print(f"Downloading: {relative_path}")
+                try:
+                    s3.download_file(S3_BUCKET, key, local_path)
+                except Exception as inner_e:
+                    print(f"Error downloading {key}: {inner_e}")
+                    continue
+                downloaded_any = True
+                total_files += 1
+    except Exception as e:
+        raise RuntimeError(f"S3 download page iteration error: {e}")
 
     if not downloaded_any:
         raise RuntimeError(f"No files found under s3://{S3_BUCKET}/{S3_PREFIX}")
@@ -175,9 +211,9 @@ async def load_model_async():
 
     MODEL_LOADING = True
     try:
-        print("load_model_async: Starting pipeline load.")
         if not os.path.exists(os.path.join(TMP_CHECKPOINT_DIR, "model_index.json")):
             print("Model not found locally. Downloading from S3...")
+            check_persistent_storage()  # raise error if storage is not usable
             download_checkpoint_from_s3()
             fix_missing_model_components()
         else:
@@ -196,6 +232,10 @@ async def load_model_async():
         MODEL_LOADED = True
         MODEL_LOADING = False
         MODEL_LOAD_ERROR = None
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print("🚀 Model loaded successfully!")
 
     except Exception as e:
@@ -204,6 +244,9 @@ async def load_model_async():
         tb_str = traceback.format_exc()
         MODEL_LOAD_ERROR = f"{e}\n{tb_str}"
         print(f"❌ Failed to load model: {MODEL_LOAD_ERROR}")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 # ----------------------------------------------------------------------
 # STARTUP EVENT
@@ -216,7 +259,9 @@ async def startup_event():
     print(f"S3 Bucket: {S3_BUCKET}")
     print(f"S3 Prefix: {S3_PREFIX}")
 
-    if not is_s3_configured():
+    if not check_persistent_storage():
+        print("WARNING: Persistent storage /home is not available or not writable.")
+    elif not is_s3_configured():
         print("WARNING: S3 credentials/configuration are incomplete. Model loading will fail.")
     else:
         asyncio.create_task(load_model_async())
@@ -237,7 +282,6 @@ def read_root():
         "device": str(DEVICE)
     }
 
-
 @app.get("/health")
 def health_check():
     if MODEL_LOAD_ERROR:
@@ -251,7 +295,6 @@ def health_check():
         "model_loading": MODEL_LOADING
     }
 
-
 @app.get("/model-status")
 def model_status():
     return {
@@ -262,7 +305,6 @@ def model_status():
         "checkpoint_dir": TMP_CHECKPOINT_DIR,
         "checkpoint_exists": os.path.exists(TMP_CHECKPOINT_DIR),
     }
-
 
 @app.post("/generate", summary="Generate a new image from an existing room photo + prompt")
 async def generate_image(
@@ -282,7 +324,7 @@ async def generate_image(
         )
     if not MODEL_LOADED or PIPELINE is None:
         # Reload model if not already loading
-        if not MODEL_LOADING and is_s3_configured():
+        if not MODEL_LOADING and is_s3_configured() and check_persistent_storage():
             asyncio.create_task(load_model_async())
         raise HTTPException(
             status_code=503,
@@ -297,7 +339,6 @@ async def generate_image(
         raise HTTPException(status_code=400, detail="Invalid image file. Please upload a valid JPEG/PNG.")
 
     try:
-        # Don't double-nest autocast; diffusers handles dtype properly
         pipe_call = PIPELINE.__call__
         if DEVICE.type == "cuda":
             with torch.autocast("cuda"):
@@ -318,7 +359,13 @@ async def generate_image(
                     num_inference_steps=FIXED_STEPS
                 )
         result_image = output.images[0]
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception as e:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         raise HTTPException(status_code=500, detail=f"Img2Img generation failed: {e}")
 
     buf = io.BytesIO()
