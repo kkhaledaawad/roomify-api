@@ -3,7 +3,7 @@ import io
 import base64
 import boto3
 import torch
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from PIL import Image
 from diffusers import StableDiffusionImg2ImgPipeline, UniPCMultistepScheduler
@@ -18,7 +18,7 @@ import json
 torch.set_num_threads(4)
 torch.set_grad_enabled(False)  # Disable gradients for inference
 
-# Force CPU for Azure App Service
+# Force CPU usage
 DEVICE = torch.device("cpu")
 print(f"Using device: {DEVICE}")
 
@@ -39,7 +39,7 @@ def is_s3_configured():
 # DEFINE GLOBAL VARIABLES
 # ----------------------------------------------------------------------
 
-# Use /home instead of /tmp for persistence on Azure App Service
+# Use /tmp for temporary/persistent storage
 CHECKPOINT_PARENT_DIR = "/tmp"
 TMP_CHECKPOINT_DIR = os.path.join(CHECKPOINT_PARENT_DIR, "checkpoint-final")
 
@@ -64,7 +64,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change in prod!
+    allow_origins=["*"],  # Change for production!
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,7 +91,7 @@ def check_persistent_storage():
         return False
 
 # ----------------------------------------------------------------------
-# UTILITY: Download model checkpoint from S3 into /home/checkpoint-final
+# UTILITY: Download model checkpoint from S3
 # ----------------------------------------------------------------------
 
 def download_checkpoint_from_s3():
@@ -103,7 +103,6 @@ def download_checkpoint_from_s3():
     # Create a marker file to track download completion
     marker_file = os.path.join(TMP_CHECKPOINT_DIR, ".download_complete")
     
-    # Check if already downloaded
     if os.path.exists(marker_file):
         print("Model already downloaded (marker file exists). Skipping S3 download.")
         return
@@ -245,7 +244,7 @@ async def load_model_async():
         
         if not os.path.exists(os.path.join(TMP_CHECKPOINT_DIR, "model_index.json")):
             print("Model not found locally. Downloading from S3...")
-            check_persistent_storage()  # raise error if storage is not usable
+            check_persistent_storage()
             download_checkpoint_from_s3()
             fix_missing_model_components()
         else:
@@ -260,7 +259,7 @@ async def load_model_async():
         # Load with CPU optimizations
         PIPELINE = StableDiffusionImg2ImgPipeline.from_pretrained(
             TMP_CHECKPOINT_DIR,
-            torch_dtype=torch.float32,  # Use float32 for CPU
+            torch_dtype=torch.float32,
             safety_checker=None,
             requires_safety_checker=False,
             low_cpu_mem_usage=True,
@@ -279,9 +278,9 @@ async def load_model_async():
             from diffusers.models.attention_processor import AttnProcessor
             PIPELINE.unet.set_attention_processor(AttnProcessor())
         
-        # Enable CPU offload for memory efficiency
-        if hasattr(PIPELINE, 'enable_sequential_cpu_offload'):
-            PIPELINE.enable_sequential_cpu_offload()
+        # ⚠️ DO NOT use enable_sequential_cpu_offload() on CPU-only
+        # if hasattr(PIPELINE, 'enable_sequential_cpu_offload'):
+        #     PIPELINE.enable_sequential_cpu_offload()
 
         MODEL_LOADED = True
         MODEL_LOADING = False
@@ -310,7 +309,7 @@ async def startup_event():
     print(f"S3 Prefix: {S3_PREFIX}")
 
     if not check_persistent_storage():
-        print("WARNING: Persistent storage /home is not available or not writable.")
+        print(f"WARNING: Persistent storage {CHECKPOINT_PARENT_DIR} is not available or not writable.")
     elif not is_s3_configured():
         print("WARNING: S3 credentials/configuration are incomplete. Model loading will fail.")
     else:
@@ -373,7 +372,6 @@ async def generate_image(
             detail=f"Model failed to load: {MODEL_LOAD_ERROR}"
         )
     if not MODEL_LOADED or PIPELINE is None:
-        # Reload model if not already loading
         if not MODEL_LOADING and is_s3_configured() and check_persistent_storage():
             asyncio.create_task(load_model_async())
         raise HTTPException(
@@ -390,32 +388,19 @@ async def generate_image(
 
     try:
         pipe_call = PIPELINE.__call__
-        if DEVICE.type == "cuda":
-            with torch.autocast("cuda"):
-                output = pipe_call(
-                    prompt=prompt,
-                    image=input_image,
-                    strength=FIXED_STRENGTH,
-                    guidance_scale=FIXED_GUIDANCE_SCALE,
-                    num_inference_steps=FIXED_STEPS
-                )
-        else:
-            with torch.no_grad():
-                output = pipe_call(
-                    prompt=prompt,
-                    image=input_image,
-                    strength=FIXED_STRENGTH,
-                    guidance_scale=FIXED_GUIDANCE_SCALE,
-                    num_inference_steps=FIXED_STEPS
-                )
+        # Since we're CPU-only, do not use autocast (which is CUDA-specific)
+        with torch.no_grad():
+            output = pipe_call(
+                prompt=prompt,
+                image=input_image,
+                strength=FIXED_STRENGTH,
+                guidance_scale=FIXED_GUIDANCE_SCALE,
+                num_inference_steps=FIXED_STEPS
+            )
         result_image = output.images[0]
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     except Exception as e:
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         raise HTTPException(status_code=500, detail=f"Img2Img generation failed: {e}")
 
     buf = io.BytesIO()
