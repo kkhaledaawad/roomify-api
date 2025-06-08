@@ -40,7 +40,7 @@ def is_s3_configured():
 # ----------------------------------------------------------------------
 
 # Use /tmp for temporary/persistent storage
-CHECKPOINT_PARENT_DIR = "/tmp"
+CHECKPOINT_PARENT_DIR = "/home"
 TMP_CHECKPOINT_DIR = os.path.join(CHECKPOINT_PARENT_DIR, "checkpoint-final")
 
 PIPELINE: Optional[StableDiffusionImg2ImgPipeline] = None
