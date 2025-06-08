@@ -40,7 +40,7 @@ def is_s3_configured():
 # ----------------------------------------------------------------------
 
 # Use /home instead of /tmp for persistence on Azure App Service
-CHECKPOINT_PARENT_DIR = "/home"
+CHECKPOINT_PARENT_DIR = "/tmp"
 TMP_CHECKPOINT_DIR = os.path.join(CHECKPOINT_PARENT_DIR, "checkpoint-final")
 
 PIPELINE: Optional[StableDiffusionImg2ImgPipeline] = None
